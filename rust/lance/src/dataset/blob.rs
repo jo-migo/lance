@@ -21,8 +21,8 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use lance_arrow::{
-    BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_INLINE_SIZE_THRESHOLD_META_KEY, FieldExt,
-    r#struct::StructArrayExt,
+    BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_INLINE_SIZE_THRESHOLD_META_KEY,
+    BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY, FieldExt, r#struct::StructArrayExt,
 };
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
@@ -67,6 +67,19 @@ pub(super) fn blob_dedicated_threshold_from_metadata(
         field_name,
         BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
         DEDICATED_THRESHOLD,
+        false,
+    )
+}
+
+pub(super) fn blob_pack_file_threshold_from_metadata(
+    metadata: &HashMap<String, String>,
+    field_name: &str,
+) -> Result<usize> {
+    blob_threshold_from_metadata(
+        metadata,
+        field_name,
+        BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
+        PACK_FILE_MAX_SIZE,
         false,
     )
 }
@@ -178,7 +191,6 @@ struct PackWriter {
     object_store: ObjectStore,
     data_dir: Path,
     data_file_key: String,
-    max_pack_size: usize,
     current_blob_id: Option<u32>,
     writer: Option<Box<dyn lance_io::traits::Writer>>,
     current_size: usize,
@@ -190,7 +202,6 @@ impl PackWriter {
             object_store,
             data_dir,
             data_file_key,
-            max_pack_size: PACK_FILE_MAX_SIZE,
             current_blob_id: None,
             writer: None,
             current_size: 0,
@@ -209,6 +220,11 @@ impl PackWriter {
     /// Append `data` to the current `.blob` file, rolling to a new file when
     /// `max_pack_size` would be exceeded.
     ///
+    /// max_pack_size: the maximum size of a pack file, already resolved by the
+    /// caller (write-param override or the blob field's metadata threshold), so
+    /// packed blobs from different fields may roll at different sizes while sharing
+    /// the same rolling writer.
+    ///
     /// alloc_blob_id: called only when a new pack file is opened; returns the
     /// blob_id used as the file name.
     ///
@@ -216,6 +232,7 @@ impl PackWriter {
     /// position is the start offset of this payload in that pack file.
     async fn write_with_allocator<F>(
         &mut self,
+        max_pack_size: usize,
         alloc_blob_id: &mut F,
         source: BlobWriteSource<'_>,
     ) -> Result<(u32, u64)>
@@ -225,7 +242,7 @@ impl PackWriter {
         let len = source.size();
         if self
             .current_blob_id
-            .map(|_| self.current_size + len > self.max_pack_size)
+            .map(|_| self.current_size + len > max_pack_size)
             .unwrap_or(true)
         {
             let blob_id = alloc_blob_id();
@@ -261,6 +278,10 @@ pub struct BlobPreprocessor {
     data_file_key: String,
     local_counter: u32,
     pack_writer: PackWriter,
+    /// Write-param override for the pack-file roll size. When set, it takes
+    /// precedence over each field's `blob-pack-file-size-threshold` metadata for
+    /// this write job only; it is not persisted into the dataset schema.
+    pack_file_size_override: Option<usize>,
     field_processors: Vec<BlobPreprocessField>,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
@@ -296,6 +317,7 @@ enum BlobPreprocessFieldKind {
     BlobV2 {
         inline_threshold: usize,
         dedicated_threshold: usize,
+        pack_file_threshold: usize,
         writer_metadata: HashMap<String, String>,
     },
     Struct {
@@ -314,6 +336,10 @@ impl BlobPreprocessField {
                         field.name(),
                     )?,
                     dedicated_threshold: blob_dedicated_threshold_from_metadata(
+                        field.metadata(),
+                        field.name(),
+                    )?,
+                    pack_file_threshold: blob_pack_file_threshold_from_metadata(
                         field.metadata(),
                         field.name(),
                     )?,
@@ -424,16 +450,13 @@ impl BlobPreprocessor {
         external_blob_mode: ExternalBlobMode,
         source_store_registry: Arc<ObjectStoreRegistry>,
         source_store_params: ObjectStoreParams,
-        pack_file_size_threshold: Option<usize>,
+        pack_file_size_override: Option<usize>,
     ) -> Result<Self> {
-        let mut pack_writer = PackWriter::new(
+        let pack_writer = PackWriter::new(
             object_store.clone(),
             data_dir.clone(),
             data_file_key.clone(),
         );
-        if let Some(max_bytes) = pack_file_size_threshold {
-            pack_writer.max_pack_size = max_bytes;
-        }
         let arrow_schema = arrow_schema::Schema::from(schema);
         let field_processors = arrow_schema
             .fields()
@@ -447,6 +470,7 @@ impl BlobPreprocessor {
             // Start at 1 to avoid a potential all-zero blob_id value.
             local_counter: 1,
             pack_writer,
+            pack_file_size_override,
             field_processors,
             external_base_resolver,
             allow_external_blob_outside_bases,
@@ -470,10 +494,20 @@ impl BlobPreprocessor {
         Ok(path)
     }
 
-    async fn write_packed(&mut self, source: BlobWriteSource<'_>) -> Result<(u32, u64)> {
+    async fn write_packed(
+        &mut self,
+        field_pack_file_threshold: usize,
+        source: BlobWriteSource<'_>,
+    ) -> Result<(u32, u64)> {
+        // The write-param override, when present, wins over the field's metadata
+        // threshold for this write job (write-param > field metadata > default).
+        let max_pack_size = self
+            .pack_file_size_override
+            .unwrap_or(field_pack_file_threshold);
         let (counter, pack_writer) = (&mut self.local_counter, &mut self.pack_writer);
         pack_writer
             .write_with_allocator(
+                max_pack_size,
                 &mut || {
                     let id = *counter;
                     *counter += 1;
@@ -600,6 +634,7 @@ impl BlobPreprocessor {
                 BlobPreprocessFieldKind::BlobV2 {
                     inline_threshold,
                     dedicated_threshold,
+                    pack_file_threshold,
                     writer_metadata,
                 } => {
                     self.preprocess_blob_array(
@@ -607,6 +642,7 @@ impl BlobPreprocessor {
                         field.as_ref(),
                         *inline_threshold,
                         *dedicated_threshold,
+                        *pack_file_threshold,
                         writer_metadata,
                     )
                     .await
@@ -678,6 +714,7 @@ impl BlobPreprocessor {
         field: &ArrowField,
         inline_threshold: usize,
         dedicated_threshold: usize,
+        pack_file_threshold: usize,
         writer_metadata: &HashMap<String, String>,
     ) -> Result<(ArrayRef, Arc<ArrowField>)> {
         let struct_arr = array
@@ -751,7 +788,10 @@ impl BlobPreprocessor {
 
             if has_data && data_len > inline_threshold {
                 let (pack_blob_id, position) = self
-                    .write_packed(BlobWriteSource::Bytes(data_col.value(i)))
+                    .write_packed(
+                        pack_file_threshold,
+                        BlobWriteSource::Bytes(data_col.value(i)),
+                    )
                     .await?;
 
                 kind_builder.append_value(BlobKind::Packed as u8);
@@ -800,7 +840,7 @@ impl BlobPreprocessor {
 
                     if data_len > inline_threshold as u64 {
                         let (pack_blob_id, position) = self
-                            .write_packed(BlobWriteSource::External(&source))
+                            .write_packed(pack_file_threshold, BlobWriteSource::External(&source))
                             .await?;
 
                         kind_builder.append_value(BlobKind::Packed as u8);
@@ -2302,7 +2342,8 @@ mod tests {
     use futures::{StreamExt, TryStreamExt, future::try_join_all};
     use lance_arrow::{
         ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
-        BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_V2_EXT_NAME, DataTypeExt,
+        BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
+        BLOB_V2_EXT_NAME, DataTypeExt,
     };
     use lance_core::datatypes::BlobKind;
     use lance_io::object_store::{
@@ -4082,10 +4123,12 @@ mod tests {
         );
     }
 
-    async fn try_preprocess_kind_with_blob_metadata(
+    async fn try_preprocess_blobs_with_blob_metadata(
         metadata_entries: Vec<(&'static str, String)>,
-        data_len: usize,
-    ) -> Result<u8> {
+        pack_file_size_override: Option<usize>,
+        blob_len: usize,
+        num_blobs: usize,
+    ) -> Result<arrow_array::StructArray> {
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             Arc::new(ObjectStoreRegistry::default()),
             "memory://blob_preprocessor",
@@ -4116,11 +4159,13 @@ mod tests {
             ExternalBlobMode::Reference,
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
-            None,
+            pack_file_size_override,
         )?;
 
-        let mut blob_builder = BlobArrayBuilder::new(1);
-        blob_builder.push_bytes(vec![0u8; data_len]).unwrap();
+        let mut blob_builder = BlobArrayBuilder::new(num_blobs);
+        for _ in 0..num_blobs {
+            blob_builder.push_bytes(vec![0u8; blob_len]).unwrap();
+        }
         let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
 
         let field_without_metadata =
@@ -4129,11 +4174,20 @@ mod tests {
         let batch = RecordBatch::try_new(batch_schema, vec![blob_array]).unwrap();
 
         let out = preprocessor.preprocess_batch(&batch).await?;
-        let struct_arr = out
+        Ok(out
             .column(0)
             .as_any()
             .downcast_ref::<arrow_array::StructArray>()
-            .unwrap();
+            .unwrap()
+            .clone())
+    }
+
+    async fn try_preprocess_kind_with_blob_metadata(
+        metadata_entries: Vec<(&'static str, String)>,
+        data_len: usize,
+    ) -> Result<u8> {
+        let struct_arr =
+            try_preprocess_blobs_with_blob_metadata(metadata_entries, None, data_len, 1).await?;
         Ok(struct_arr
             .column_by_name("kind")
             .unwrap()
@@ -4148,6 +4202,27 @@ mod tests {
         try_preprocess_kind_with_blob_metadata(metadata_entries, data_len)
             .await
             .unwrap()
+    }
+
+    async fn packed_blobs_with_blob_metadata(
+        metadata_entries: Vec<(&'static str, String)>,
+        pack_file_size_override: Option<usize>,
+        blob_len: usize,
+        num_blobs: usize,
+    ) -> Vec<u32> {
+        let struct_arr = try_preprocess_blobs_with_blob_metadata(
+            metadata_entries,
+            pack_file_size_override,
+            blob_len,
+            num_blobs,
+        )
+        .await
+        .unwrap();
+        let blob_ids = struct_arr
+            .column_by_name("blob_id")
+            .unwrap()
+            .as_primitive::<arrow::datatypes::UInt32Type>();
+        (0..struct_arr.len()).map(|i| blob_ids.value(i)).collect()
     }
 
     #[tokio::test]
@@ -4238,6 +4313,61 @@ mod tests {
         )
         .await;
         assert_eq!(kind, lance_core::datatypes::BlobKind::Packed as u8);
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_pack_file_threshold_rolls_at_metadata_value() {
+        // Blobs must exceed the inline cutoff to be packed at all. With a pack-file
+        // threshold equal to a single blob's size, each of the three blobs rolls to its
+        // own pack file (a distinct blob_id).
+        let blob_len = super::INLINE_MAX + 1024;
+        let blob_ids = packed_blobs_with_blob_metadata(
+            vec![(BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY, blob_len.to_string())],
+            None,
+            blob_len,
+            3,
+        )
+        .await;
+        let distinct: std::collections::HashSet<u32> = blob_ids.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "expected one pack file per blob: {blob_ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_pack_file_threshold_packs_within_metadata_value() {
+        // A pack-file threshold large enough for all three blobs keeps them in a single
+        // pack file (one shared blob_id).
+        let blob_len = super::INLINE_MAX + 1024;
+        let blob_ids = packed_blobs_with_blob_metadata(
+            vec![(
+                BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
+                (blob_len * 3).to_string(),
+            )],
+            None,
+            blob_len,
+            3,
+        )
+        .await;
+        let distinct: std::collections::HashSet<u32> = blob_ids.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "expected a single shared pack file: {blob_ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_pack_file_threshold_rejects_non_positive_metadata() {
+        let err = try_preprocess_kind_with_blob_metadata(
+            vec![(BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY, "0".to_string())],
+            1024,
+        )
+        .await
+        .expect_err("zero pack-file threshold should be rejected");
+        assert!(err.to_string().contains("expected a positive integer"));
     }
 
     #[tokio::test]
@@ -4565,5 +4695,26 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_pack_file_threshold_write_param_overrides_metadata() {
+        let blob_len = super::INLINE_MAX + 1024;
+        let blob_ids = packed_blobs_with_blob_metadata(
+            vec![(
+                BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
+                (blob_len * 3).to_string(),
+            )],
+            Some(blob_len),
+            blob_len,
+            3,
+        )
+        .await;
+        let distinct: std::collections::HashSet<u32> = blob_ids.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "write-param override should force one pack file per blob: {blob_ids:?}"
+        );
     }
 }

@@ -8,7 +8,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
-    BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME,
+    BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_META_KEY, BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
+    BLOB_V2_EXT_NAME,
 };
 use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
@@ -40,7 +41,7 @@ use crate::Dataset;
 use crate::dataset::blob::{
     BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
-    preprocess_blob_batches,
+    blob_pack_file_threshold_from_metadata, preprocess_blob_batches,
 };
 use crate::session::Session;
 
@@ -195,49 +196,32 @@ fn validate_blob_threshold_metadata_for_append(
             continue;
         }
 
-        let has_inline_threshold = input_field
-            .metadata
-            .contains_key(BLOB_INLINE_SIZE_THRESHOLD_META_KEY);
-        let has_dedicated_threshold = input_field
-            .metadata
-            .contains_key(BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY);
-        if !has_inline_threshold && !has_dedicated_threshold {
-            continue;
-        }
-
-        if has_inline_threshold {
-            let input_inline_threshold =
-                blob_inline_threshold_from_metadata(&input_field.metadata, &input_field.name)?;
-            let dataset_inline_threshold =
-                blob_inline_threshold_from_metadata(&dataset_field.metadata, &dataset_field.name)?;
-            if input_inline_threshold != dataset_inline_threshold {
-                return Err(Error::invalid_input(format!(
-                    "Cannot append data with blob threshold metadata {}={} for field '{}'; \
-                     the dataset schema has effective value {}. Blob thresholds for existing \
-                     columns are stored in the dataset schema.",
-                    BLOB_INLINE_SIZE_THRESHOLD_META_KEY,
-                    input_inline_threshold,
-                    input_field.name,
-                    dataset_inline_threshold,
-                )));
+        for (key, read_threshold) in [
+            (
+                BLOB_INLINE_SIZE_THRESHOLD_META_KEY,
+                blob_inline_threshold_from_metadata
+                    as fn(&HashMap<String, String>, &str) -> Result<usize>,
+            ),
+            (
+                BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
+                blob_dedicated_threshold_from_metadata,
+            ),
+            (
+                BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
+                blob_pack_file_threshold_from_metadata,
+            ),
+        ] {
+            if !input_field.metadata.contains_key(key) {
+                continue;
             }
-        }
-        if has_dedicated_threshold {
-            let input_dedicated_threshold =
-                blob_dedicated_threshold_from_metadata(&input_field.metadata, &input_field.name)?;
-            let dataset_dedicated_threshold = blob_dedicated_threshold_from_metadata(
-                &dataset_field.metadata,
-                &dataset_field.name,
-            )?;
-            if input_dedicated_threshold != dataset_dedicated_threshold {
+            let input_value = read_threshold(&input_field.metadata, &input_field.name)?;
+            let dataset_value = read_threshold(&dataset_field.metadata, &dataset_field.name)?;
+            if input_value != dataset_value {
                 return Err(Error::invalid_input(format!(
-                    "Cannot append data with blob threshold metadata {}={} for field '{}'; \
-                     the dataset schema has effective value {}. Blob thresholds for existing \
-                     columns are stored in the dataset schema.",
-                    BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
-                    input_dedicated_threshold,
+                    "Cannot append data with blob threshold metadata {key}={input_value} for \
+                     field '{}'; the dataset schema has effective value {dataset_value}. Blob \
+                     thresholds for existing columns are stored in the dataset schema.",
                     input_field.name,
-                    dataset_dedicated_threshold,
                 )));
             }
         }
