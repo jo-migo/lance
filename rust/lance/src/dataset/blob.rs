@@ -194,6 +194,7 @@ struct PackWriter {
     current_blob_id: Option<u32>,
     writer: Option<Box<dyn lance_io::traits::Writer>>,
     current_size: usize,
+    current_max_pack_size: Option<usize>,
 }
 
 impl PackWriter {
@@ -205,25 +206,30 @@ impl PackWriter {
             current_blob_id: None,
             writer: None,
             current_size: 0,
+            current_max_pack_size: None,
         }
     }
 
-    async fn start_new_pack(&mut self, blob_id: u32) -> Result<()> {
+    async fn start_new_pack(&mut self, blob_id: u32, max_pack_size: usize) -> Result<()> {
         let path = blob_path(&self.data_dir, &self.data_file_key, blob_id);
         let writer = self.object_store.create(&path).await?;
         self.writer = Some(writer);
         self.current_blob_id = Some(blob_id);
         self.current_size = 0;
+        self.current_max_pack_size = Some(max_pack_size);
         Ok(())
     }
 
     /// Append `data` to the current `.blob` file, rolling to a new file when
-    /// `max_pack_size` would be exceeded.
+    /// `max_pack_size` would be exceeded or when it differs from the threshold the
+    /// current file was opened under.
     ///
     /// max_pack_size: the maximum size of a pack file, already resolved by the
-    /// caller (write-param override or the blob field's metadata threshold), so
-    /// packed blobs from different fields may roll at different sizes while sharing
-    /// the same rolling writer.
+    /// caller (write-param override or the blob field's metadata threshold). Fields
+    /// with different thresholds share this rolling writer, so each pack file is
+    /// kept to a single threshold — a payload whose `max_pack_size` differs from the
+    /// open file's threshold rolls a new file rather than extending the existing one
+    /// past its (possibly smaller) bound.
     ///
     /// alloc_blob_id: called only when a new pack file is opened; returns the
     /// blob_id used as the file name.
@@ -240,14 +246,19 @@ impl PackWriter {
         F: FnMut() -> u32,
     {
         let len = source.size();
-        if self
-            .current_blob_id
-            .map(|_| self.current_size + len > max_pack_size)
-            .unwrap_or(true)
-        {
+        // Roll to a new file when the current one was opened under a different
+        // threshold, or when appending this payload would exceed it.
+        let needs_new_pack = match self.current_max_pack_size {
+            Some(current_max_pack_size) => {
+                current_max_pack_size != max_pack_size
+                    || self.current_size + len > current_max_pack_size
+            }
+            None => true,
+        };
+        if needs_new_pack {
             let blob_id = alloc_blob_id();
             self.finish().await?;
-            self.start_new_pack(blob_id).await?;
+            self.start_new_pack(blob_id, max_pack_size).await?;
         }
 
         let writer = self.writer.as_mut().expect("pack writer is initialized");
@@ -263,6 +274,7 @@ impl PackWriter {
         }
         self.current_blob_id = None;
         self.current_size = 0;
+        self.current_max_pack_size = None;
         Ok(())
     }
 }

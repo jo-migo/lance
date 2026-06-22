@@ -184,18 +184,25 @@ fn validate_blob_threshold_metadata_for_append(
         let Some(dataset_field) = dataset_schema.field(&input_field.name) else {
             continue;
         };
-        let input_is_blob_v2 = input_field
-            .metadata
-            .get(ARROW_EXT_NAME_KEY)
-            .is_some_and(|extension_name| extension_name == BLOB_V2_EXT_NAME);
-        let dataset_is_blob_v2 = dataset_field
-            .metadata
-            .get(ARROW_EXT_NAME_KEY)
-            .is_some_and(|extension_name| extension_name == BLOB_V2_EXT_NAME);
-        if !input_is_blob_v2 && !dataset_is_blob_v2 {
-            continue;
-        }
+        validate_blob_threshold_metadata_for_field_recursive(input_field, dataset_field)?;
+    }
 
+    Ok(())
+}
+
+fn validate_blob_threshold_metadata_for_field_recursive(
+    input_field: &lance_core::datatypes::Field,
+    dataset_field: &lance_core::datatypes::Field,
+) -> Result<()> {
+    let input_is_blob_v2 = input_field
+        .metadata
+        .get(ARROW_EXT_NAME_KEY)
+        .is_some_and(|extension_name| extension_name == BLOB_V2_EXT_NAME);
+    let dataset_is_blob_v2 = dataset_field
+        .metadata
+        .get(ARROW_EXT_NAME_KEY)
+        .is_some_and(|extension_name| extension_name == BLOB_V2_EXT_NAME);
+    if input_is_blob_v2 || dataset_is_blob_v2 {
         for (key, read_threshold) in [
             (
                 BLOB_INLINE_SIZE_THRESHOLD_META_KEY,
@@ -225,6 +232,13 @@ fn validate_blob_threshold_metadata_for_append(
                 )));
             }
         }
+    }
+
+    for input_child in &input_field.children {
+        let Some(dataset_child) = dataset_field.child(&input_child.name) else {
+            continue;
+        };
+        validate_blob_threshold_metadata_for_field_recursive(input_child, dataset_child)?;
     }
 
     Ok(())
